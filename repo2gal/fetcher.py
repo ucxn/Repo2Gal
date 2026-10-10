@@ -1,3 +1,4 @@
+
 """GitHub 采集适配层（Chronicle / Overview / Quick Start 模式）。
 
 GitHub 的认证、分页、限流、重试、GraphQL、Discussion、wiki 与增量备份
@@ -281,6 +282,43 @@ _WORKFLOW_SUFFIXES = (".yml", ".yaml")
 _WORKFLOW_FILE_LIMIT = 3
 
 
+def _resolve_backup_repo_dir(backup_root: Path, repo: str) -> Path:
+    """解析 python-github-backup 实际写出的仓库目录，兼容仓库名大小写差异。
+
+    GitHub 仓库名在 API/命令参数与备份工具落盘结果中的大小写可能不同；
+    Linux 文件系统区分大小写，因此先优先使用精确路径，再做唯一的忽略大小写匹配。
+    """
+    repositories_dir = Path(backup_root).resolve() / "repositories"
+    expected = repositories_dir / repo
+
+    # 优先保留原有的精确路径行为。
+    if expected.exists():
+        return expected
+
+    if not repositories_dir.is_dir():
+        return expected
+
+    # 上游可能使用 GitHub 返回的规范仓库名创建目录，例如 ZTE-Stat_Max，
+    # 而调用方传入的是 zte-stat_max。只匹配直接子目录，避免误匹配其他路径。
+    matches = [
+        path
+        for path in repositories_dir.iterdir()
+        if path.is_dir() and path.name.casefold() == repo.casefold()
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        names = ", ".join(sorted(path.name for path in matches))
+        raise FetchError(
+            f"备份目录存在多个大小写匹配项，无法确定仓库目录：{repo}（{names}）"
+        )
+
+    # 未找到时仍返回预期路径，由调用方输出原有错误信息。
+    return expected
+
+
 def run_backup(
     owner: str,
     repo: str,
@@ -311,7 +349,7 @@ def run_backup(
         raise FetchError("找不到 github-backup，请执行 pip install github-backup")
 
     backup_root = Path(backup_root).resolve()
-    repo_dir = backup_root / "repositories" / repo
+    repo_dir = _resolve_backup_repo_dir(backup_root, repo)
     backup_root.mkdir(parents=True, exist_ok=True)
 
     command = [
@@ -368,8 +406,11 @@ def run_backup(
         if token_file:
             Path(token_file).unlink(missing_ok=True)
 
+    # 重新解析实际目录。上游工具可能使用规范仓库名的大小写落盘。
+    repo_dir = _resolve_backup_repo_dir(backup_root, repo)
     if not repo_dir.exists():
         raise FetchError(f"github-backup 未产出预期目录：{repo_dir}")
+
     log(f"原始备份已保存：{repo_dir}")
     return repo_dir
 
@@ -946,7 +987,9 @@ def fetch_context(
             "python-github-backup 需要 GitHub Token；请设置 GITHUB_TOKEN，"
             "或用 --reuse-backup 读取已有备份"
         )
-    expected = Path(backup_root).resolve() / "repositories" / repo
+
+    # 复用备份时也采用大小写不敏感的唯一匹配，避免同一问题再次出现。
+    expected = _resolve_backup_repo_dir(backup_root, repo)
     if reuse_backup:
         if not expected.exists():
             raise FetchError(f"--reuse-backup 指定的备份不存在：{expected}")
